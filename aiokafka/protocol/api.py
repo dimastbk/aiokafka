@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import abc
 from io import BytesIO
-from typing import Any, ClassVar, Dict, Optional, Type, Union
+from typing import Any, ClassVar, Dict, Generic, Optional, Type, Union
+
+from typing_extensions import TypeVar
 
 from .struct import Struct
 from .types import Array, Int16, Int32, Schema, String, TaggedFields
+
+ResponseT = TypeVar("ResponseT", bound="Response", default="Response")
 
 
 class RequestHeader_v0(Struct):
@@ -51,6 +55,8 @@ class ResponseHeader_v0(Struct):
         ("correlation_id", Int32),
     )
 
+    correlation_id: int
+
 
 class ResponseHeader_v1(Struct):
     SCHEMA = Schema(
@@ -58,8 +64,10 @@ class ResponseHeader_v1(Struct):
         ("tags", TaggedFields),
     )
 
+    correlation_id: int
 
-class Request(Struct, metaclass=abc.ABCMeta):
+
+class Request(Generic[ResponseT], Struct, metaclass=abc.ABCMeta):
     FLEXIBLE_VERSION: ClassVar[bool] = False
 
     @property
@@ -74,7 +82,7 @@ class Request(Struct, metaclass=abc.ABCMeta):
 
     @property
     @abc.abstractmethod
-    def RESPONSE_TYPE(self) -> Type[Response]:
+    def RESPONSE_TYPE(self) -> Type[ResponseT]:
         """The Response class associated with the api request"""
 
     @property

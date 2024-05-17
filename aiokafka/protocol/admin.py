@@ -495,21 +495,21 @@ class SaslHandShakeResponse_v1(Response):
     SCHEMA = SaslHandShakeResponse_v0.SCHEMA
 
 
-class SaslHandShakeRequest_v0(Request):
+class SaslHandShakeRequest_v0(Request[SaslHandShakeResponse_v0]):
     API_KEY = 17
     API_VERSION = 0
     RESPONSE_TYPE = SaslHandShakeResponse_v0
     SCHEMA = Schema(("mechanism", String("utf-8")))
 
 
-class SaslHandShakeRequest_v1(Request):
+class SaslHandShakeRequest_v1(Request[SaslHandShakeResponse_v1]):
     API_KEY = 17
     API_VERSION = 1
     RESPONSE_TYPE = SaslHandShakeResponse_v1
     SCHEMA = SaslHandShakeRequest_v0.SCHEMA
 
 
-SaslHandShakeRequest = [SaslHandShakeRequest_v0, SaslHandShakeRequest_v1]
+SaslHandShakeRequest = (SaslHandShakeRequest_v0, SaslHandShakeRequest_v1)
 SaslHandShakeResponse = [SaslHandShakeResponse_v0, SaslHandShakeResponse_v1]
 
 
@@ -1004,24 +1004,24 @@ class SaslAuthenticateResponse_v1(Response):
     )
 
 
-class SaslAuthenticateRequest_v0(Request):
+class SaslAuthenticateRequest_v0(Request[SaslAuthenticateResponse_v0]):
     API_KEY = 36
     API_VERSION = 0
     RESPONSE_TYPE = SaslAuthenticateResponse_v0
     SCHEMA = Schema(("sasl_auth_bytes", Bytes))
 
 
-class SaslAuthenticateRequest_v1(Request):
+class SaslAuthenticateRequest_v1(Request[SaslAuthenticateResponse_v1]):
     API_KEY = 36
     API_VERSION = 1
     RESPONSE_TYPE = SaslAuthenticateResponse_v1
     SCHEMA = SaslAuthenticateRequest_v0.SCHEMA
 
 
-SaslAuthenticateRequest = [
+SaslAuthenticateRequest = (
     SaslAuthenticateRequest_v0,
     SaslAuthenticateRequest_v1,
-]
+)
 SaslAuthenticateResponse = [
     SaslAuthenticateResponse_v0,
     SaslAuthenticateResponse_v1,

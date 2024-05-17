@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import collections
+import enum
 import functools
 import hashlib
 import hmac
@@ -8,6 +11,7 @@ import io
 import logging
 import random
 import socket
+import ssl
 import struct
 import sys
 import time
@@ -15,8 +19,28 @@ import traceback
 import uuid
 import warnings
 import weakref
+from typing import (
+    Any,
+    Callable,
+    Coroutine,
+    Dict,
+    Final,
+    Generator,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    overload,
+)
 
 import async_timeout
+from typing_extensions import Buffer, Self
 
 import aiokafka.errors as Errors
 from aiokafka.abc import AbstractTokenProvider
@@ -25,6 +49,7 @@ from aiokafka.protocol.admin import (
     SaslAuthenticateRequest,
     SaslHandShakeRequest,
 )
+from aiokafka.protocol.api import Request, Response
 from aiokafka.protocol.commit import (
     GroupCoordinatorResponse_v0 as GroupCoordinatorResponse,
 )
@@ -33,19 +58,22 @@ from aiokafka.util import create_future, create_task, get_running_loop, wait_for
 try:
     import gssapi
 except ImportError:
-    gssapi = None
+    gssapi = None  # type: ignore[assignment]
 
 __all__ = ["AIOKafkaConnection", "create_conn"]
 
+RequestT = TypeVar("RequestT", bound=Request[Any])
+ResponseT = TypeVar("ResponseT", bound=Response)
+
 log = logging.getLogger(__name__)
 
-DEFAULT_KAFKA_PORT = 9092
+DEFAULT_KAFKA_PORT: Final = 9092
 
-READER_LIMIT = 2**16
-SASL_QOP_AUTH = 1
+READER_LIMIT: Final = 2**16
+SASL_QOP_AUTH: Final = 1
 
 
-class CloseReason:
+class CloseReason(enum.IntEnum):
     CONNECTION_BROKEN = 0
     CONNECTION_TIMEOUT = 1
     OUT_OF_SYNC = 2
@@ -55,10 +83,10 @@ class CloseReason:
 
 
 class VersionInfo:
-    def __init__(self, versions):
+    def __init__(self, versions: Mapping[int, Tuple[int, int]]) -> None:
         self._versions = versions
 
-    def pick_best(self, request_versions):
+    def pick_best(self, request_versions: Sequence[Type[RequestT]]) -> Type[RequestT]:
         api_key = request_versions[0].API_KEY
         if api_key not in self._versions:
             return request_versions[0]
@@ -75,24 +103,28 @@ class VersionInfo:
 
 
 async def create_conn(
-    host,
-    port,
+    host: str,
+    port: int,
     *,
-    client_id="aiokafka",
-    request_timeout_ms=40000,
-    api_version=(0, 8, 2),
-    ssl_context=None,
-    security_protocol="PLAINTEXT",
-    max_idle_ms=None,
-    on_close=None,
-    sasl_mechanism=None,
-    sasl_plain_username=None,
-    sasl_plain_password=None,
-    sasl_kerberos_service_name="kafka",
-    sasl_kerberos_domain_name=None,
-    sasl_oauth_token_provider=None,
-    version_hint=None,
-):
+    client_id: str = "aiokafka",
+    request_timeout_ms: int = 40000,
+    api_version: Tuple[int, int, int] = (0, 8, 2),
+    ssl_context: Optional[ssl.SSLContext] = None,
+    security_protocol: Literal[
+        "PLAINTEXT", "SASL_PLAINTEXT", "SSL", "SASL_SSL"
+    ] = "PLAINTEXT",
+    max_idle_ms: Optional[int] = None,
+    on_close: Optional[
+        Callable[[AIOKafkaConnection, Optional[CloseReason]], None]
+    ] = None,
+    sasl_mechanism: Literal["GSSAPI", "OAUTHBEARER", None] = None,
+    sasl_plain_username: Optional[str] = None,
+    sasl_plain_password: Optional[str] = None,
+    sasl_kerberos_service_name: Optional[str] = "kafka",
+    sasl_kerberos_domain_name: Optional[str] = None,
+    sasl_oauth_token_provider: Optional[AbstractTokenProvider] = None,
+    version_hint: Optional[Tuple[int, int, int]] = None,
+) -> AIOKafkaConnection:
     conn = AIOKafkaConnection(
         host,
         port,
@@ -116,11 +148,17 @@ async def create_conn(
 
 
 class AIOKafkaProtocol(asyncio.StreamReaderProtocol):
-    def __init__(self, closed_fut, *args, loop, **kw):
+    def __init__(
+        self,
+        closed_fut: asyncio.Future,
+        *args: Any,
+        loop: asyncio.AbstractEventLoop,
+        **kw: Any,
+    ) -> None:
         self._closed_fut = closed_fut
         super().__init__(*args, loop=loop, **kw)
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: Optional[Exception]) -> None:
         super().connection_lost(exc)
         if not self._closed_fut.cancelled():
             self._closed_fut.set_result(None)
@@ -134,24 +172,30 @@ class AIOKafkaConnection:
 
     def __init__(
         self,
-        host,
-        port,
+        host: str,
+        port: int,
         *,
-        client_id="aiokafka",
-        request_timeout_ms=40000,
-        api_version=(0, 8, 2),
-        ssl_context=None,
-        security_protocol="PLAINTEXT",
-        max_idle_ms=None,
-        on_close=None,
-        sasl_mechanism=None,
-        sasl_plain_password=None,
-        sasl_plain_username=None,
-        sasl_kerberos_service_name="kafka",
-        sasl_kerberos_domain_name=None,
-        sasl_oauth_token_provider=None,
-        version_hint=None,
-    ):
+        client_id: str = "aiokafka",
+        request_timeout_ms: int = 40000,
+        api_version: Tuple[int, int, int] = (0, 8, 2),
+        ssl_context: Optional[ssl.SSLContext] = None,
+        security_protocol: Literal[
+            "PLAINTEXT", "SASL_PLAINTEXT", "SSL", "SASL_SSL"
+        ] = "PLAINTEXT",
+        max_idle_ms: Optional[int] = None,
+        on_close: Optional[
+            Callable[[AIOKafkaConnection, Optional[CloseReason]], None]
+        ] = None,
+        sasl_mechanism: Literal[
+            "PLAIN", "GSSAPI", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER", None
+        ] = None,
+        sasl_plain_password: Optional[str] = None,
+        sasl_plain_username: Optional[str] = None,
+        sasl_kerberos_service_name: str = "kafka",
+        sasl_kerberos_domain_name: Optional[str] = None,
+        sasl_oauth_token_provider: Optional[AbstractTokenProvider] = None,
+        version_hint: Optional[Tuple[int, int, int]] = None,
+    ) -> None:
         loop = get_running_loop()
 
         if sasl_mechanism == "GSSAPI":
@@ -191,14 +235,19 @@ class AIOKafkaConnection:
         self._reader = self._writer = self._protocol = None
         # Even on small size seems to be a bit faster than list.
         # ~2x on size of 2 in Python3.6
-        self._requests = collections.deque()
-        self._read_task = None
-        self._correlation_id = 0
-        self._closed_fut = None
+        self._requests: collections.deque[
+            Union[
+                Tuple[None, None, asyncio.Future[Any]],
+                Tuple[int, Request[Response], asyncio.Future[Any]],
+            ]
+        ] = collections.deque()
+        self._read_task: Optional[asyncio.Task[None]] = None
+        self._correlation_id: int = 0
+        self._closed_fut: Optional[asyncio.Future[None]] = None
 
         self._max_idle_ms = max_idle_ms
         self._last_action = time.monotonic()
-        self._idle_handle = None
+        self._idle_handle: Optional[asyncio.Handle] = None
 
         self._on_close_cb = on_close
 
@@ -230,7 +279,7 @@ class AIOKafkaConnection:
                 context["source_traceback"] = self._source_traceback
             self._loop.call_exception_handler(context)
 
-    async def connect(self):
+    async def connect(self) -> None:
         loop = self._loop
         self._closed_fut = create_future()
         if self._security_protocol in ["PLAINTEXT", "SASL_PLAINTEXT"]:
@@ -271,7 +320,7 @@ class AIOKafkaConnection:
     async def _do_version_lookup(self):
         version_req = ApiVersionRequest[0]()
         response = await self.send(version_req)
-        versions = {}
+        versions: Dict[int, Tuple[int, int]] = {}
         for api_key, min_version, max_version in response.api_versions:
             assert min_version <= max_version, (
                 f"{min_version} should be less than"
@@ -280,7 +329,7 @@ class AIOKafkaConnection:
             versions[api_key] = (min_version, max_version)
         self._version_info = VersionInfo(versions)
 
-    async def _do_sasl_handshake(self):
+    async def _do_sasl_handshake(self) -> None:
         # NOTE: We will only fallback to v0.9 gssapi scheme if user explicitly
         #       stated, that api_version is "0.9"
         if self._version_hint and self._version_hint < (0, 10):
@@ -332,7 +381,7 @@ class AIOKafkaConnection:
         else:
             auth_klass = None
 
-        auth_bytes = None
+        auth_bytes: Optional[bytes] = None
         expect_response = True
 
         while True:
@@ -368,20 +417,23 @@ class AIOKafkaConnection:
                 self._sasl_mechanism,
             )
 
-    def authenticator_plain(self):
+    def authenticator_plain(self) -> SaslPlainAuthenticator:
         return SaslPlainAuthenticator(
             loop=self._loop,
             sasl_plain_password=self._sasl_plain_password,
             sasl_plain_username=self._sasl_plain_username,
         )
 
-    def authenticator_gssapi(self):
+    def authenticator_gssapi(self) -> SaslGSSAPIAuthenticator:
         return SaslGSSAPIAuthenticator(
             loop=self._loop,
             principal=self.sasl_principal,
         )
 
-    def authenticator_scram(self):
+    def authenticator_scram(self) -> ScramAuthenticator:
+        assert self._sasl_plain_password is not None
+        assert self._sasl_plain_username is not None
+        assert self._sasl_mechanism in ("SCRAM-SHA-256", "SCRAM-SHA-512")
         return ScramAuthenticator(
             loop=self._loop,
             sasl_plain_password=self._sasl_plain_password,
@@ -389,20 +441,20 @@ class AIOKafkaConnection:
             sasl_mechanism=self._sasl_mechanism,
         )
 
-    def authenticator_oauth(self):
+    def authenticator_oauth(self) -> OAuthAuthenticator:
         return OAuthAuthenticator(
             sasl_oauth_token_provider=self._sasl_oauth_token_provider,
         )
 
     @property
-    def sasl_principal(self):
+    def sasl_principal(self) -> str:
         service = self._sasl_kerberos_service_name
         domain = self._sasl_kerberos_domain_name or self.host
 
         return f"{service}@{domain}"
 
     @classmethod
-    def _on_read_task_error(cls, self_ref, read_task):
+    def _on_read_task_error(cls, self_ref: weakref.ReferenceType[Self], read_task):
         # We don't want to react to cancelled errors
         if read_task.cancelled():
             return
@@ -418,7 +470,7 @@ class AIOKafkaConnection:
                 self.close(reason=CloseReason.CONNECTION_BROKEN, exc=exc)
 
     @staticmethod
-    def _idle_check(self_ref):
+    def _idle_check(self_ref: weakref.ReferenceType[Self]) -> None:
         self = self_ref()
         if self is None:
             return
@@ -440,18 +492,31 @@ class AIOKafkaConnection:
                 wake_up_in, self._idle_check, self_ref
             )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<AIOKafkaConnection host={self.host} port={self.port}>"
 
     @property
-    def host(self):
+    def host(self) -> str:
         return self._host
 
     @property
-    def port(self):
+    def port(self) -> int:
         return self._port
 
-    def send(self, request, expect_response=True):
+    @overload
+    def send(self, request: Request[ResponseT]) -> Coroutine[None, None, ResponseT]: ...
+    @overload
+    def send(
+        self, request: Request[ResponseT], expect_response: Literal[True]
+    ) -> Coroutine[None, None, ResponseT]: ...
+    @overload
+    def send(
+        self, request: Request[ResponseT], expect_response: Literal[False]
+    ) -> Coroutine[None, None, Optional[ResponseT]]: ...
+
+    def send(
+        self, request: Request[ResponseT], expect_response: bool = True
+    ) -> Coroutine[None, None, Optional[ResponseT]]:
         if self._writer is None:
             raise Errors.KafkaConnectionError(
                 f"No connection to broker at {self._host}:{self._port}"
@@ -481,7 +546,9 @@ class AIOKafkaConnection:
         )
         return wait_for(fut, self._request_timeout)
 
-    def _send_sasl_token(self, payload, expect_response=True):
+    def _send_sasl_token(
+        self, payload: bytes, expect_response: bool = True
+    ) -> Coroutine[None, None, None]:
         if self._writer is None:
             raise Errors.KafkaConnectionError(
                 f"No connection to broker at {self._host}:{self._port}"
@@ -502,10 +569,12 @@ class AIOKafkaConnection:
         self._requests.append((None, None, fut))
         return wait_for(fut, self._request_timeout)
 
-    def connected(self):
+    def connected(self) -> bool:
         return bool(self._reader is not None and not self._reader.at_eof())
 
-    def close(self, reason=None, exc=None):
+    def close(
+        self, reason: Optional[CloseReason] = None, exc: Optional[Exception] = None
+    ) -> Optional[asyncio.Future]:
         log.debug("Closing connection at %s:%s", self._host, self._port)
         if self._reader is not None:
             self._writer.close()
@@ -533,7 +602,7 @@ class AIOKafkaConnection:
         # a future in case we need to wait on it.
         return self._closed_fut
 
-    def _create_reader_task(self):
+    def _create_reader_task(self) -> asyncio.Task[None]:
         self_ref = weakref.ref(self)
         read_task = create_task(self._read(self_ref))
         read_task.add_done_callback(
@@ -542,7 +611,7 @@ class AIOKafkaConnection:
         return read_task
 
     @staticmethod
-    async def _read(self_ref):
+    async def _read(self_ref: weakref.ReferenceType[Self]) -> None:
         # XXX: I know that it become a bit more ugly once cyclic references
         # were removed, but it's needed to allow connections to properly
         # release resources if leaked.
@@ -552,6 +621,7 @@ class AIOKafkaConnection:
             return
         reader = self._reader
         del self
+        assert reader
 
         while True:
             resp = await reader.readexactly(4)
@@ -565,15 +635,17 @@ class AIOKafkaConnection:
             self._handle_frame(resp)
             del self
 
-    def _handle_frame(self, resp):
+    def _handle_frame(self, resp: bytes):
         correlation_id, request, fut = self._requests[0]
 
         if correlation_id is None:  # Is a SASL packet, just pass it though
             if not fut.done():
                 fut.set_result(resp)
         else:
-            resp = io.BytesIO(resp)
-            response_header = request.parse_response_header(resp)
+            assert request is not None
+
+            resp_io = io.BytesIO(resp)
+            response_header = request.parse_response_header(resp_io)
             resp_type = request.RESPONSE_TYPE
 
             if (
@@ -600,7 +672,7 @@ class AIOKafkaConnection:
                 return
 
             if not fut.done():
-                response = resp_type.decode(resp)
+                response = resp_type.decode(resp_io)
                 log.debug("%s Response %d: %s", self, correlation_id, response)
                 fut.set_result(response)
 
@@ -611,13 +683,18 @@ class AIOKafkaConnection:
         # this future.
         self._requests.popleft()
 
-    def _next_correlation_id(self):
+    def _next_correlation_id(self) -> int:
         self._correlation_id = (self._correlation_id + 1) % 2**31
         return self._correlation_id
 
 
 class BaseSaslAuthenticator:
-    def step(self, payload):
+    _authenticator: Generator[Tuple[bytes, bool], None, None]
+    _loop: asyncio.AbstractEventLoop
+
+    def step(
+        self, payload: Optional[bytes]
+    ) -> asyncio.Future[Optional[Tuple[bytes, bool]]]:
         return self._loop.run_in_executor(None, self._step, payload)
 
     def _step(self, payload):
@@ -635,13 +712,21 @@ class BaseSaslAuthenticator:
 
 
 class SaslPlainAuthenticator(BaseSaslAuthenticator):
-    def __init__(self, *, loop, sasl_plain_password, sasl_plain_username):
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        sasl_plain_password,
+        sasl_plain_username,
+    ) -> None:
         self._loop = loop
         self._sasl_plain_username = sasl_plain_username
         self._sasl_plain_password = sasl_plain_password
-        self._authenticator = self.authenticator_plain()
+        self._authenticator: Generator[Tuple[bytes, bool], None, None] = (
+            self.authenticator_plain()
+        )
 
-    def authenticator_plain(self):
+    def authenticator_plain(self) -> Generator[Tuple[bytes, bool], None, None]:
         """Automaton to authenticate with SASL tokens"""
         # Send PLAIN credentials per RFC-4616
         data = "\0".join(
@@ -658,7 +743,7 @@ class SaslPlainAuthenticator(BaseSaslAuthenticator):
 
 
 class SaslGSSAPIAuthenticator(BaseSaslAuthenticator):
-    def __init__(self, *, loop, principal):
+    def __init__(self, *, loop: asyncio.AbstractEventLoop, principal) -> None:
         self._loop = loop
         self._principal = principal
         self._authenticator = self.authenticator_gssapi()
@@ -672,13 +757,14 @@ class SaslGSSAPIAuthenticator(BaseSaslAuthenticator):
 
         client_ctx = gssapi.SecurityContext(name=cname, usage="initiate")
 
-        server_token = None
+        server_token: Optional[bytes] = None
         while not client_ctx.complete:
             client_token = client_ctx.step(server_token)
             client_token = client_token or b""
 
             server_token = yield client_token, True
 
+        assert server_token is not None
         msg = client_ctx.unwrap(server_token).message
 
         qop = struct.pack("b", SASL_QOP_AUTH & msg[0])
@@ -689,7 +775,9 @@ class SaslGSSAPIAuthenticator(BaseSaslAuthenticator):
 
 
 class ScramAuthenticator(BaseSaslAuthenticator):
-    MECHANISMS = {
+    MECHANISMS: Dict[
+        Literal["SCRAM-SHA-256", "SCRAM-SHA-512"], Callable[[Buffer], hashlib._Hash]
+    ] = {
         "SCRAM-SHA-256": hashlib.sha256,
         "SCRAM-SHA-512": hashlib.sha512,
     }
@@ -697,25 +785,25 @@ class ScramAuthenticator(BaseSaslAuthenticator):
     def __init__(
         self,
         *,
-        loop,
-        sasl_plain_password,
-        sasl_plain_username,
-        sasl_mechanism,
-    ):
+        loop: asyncio.AbstractEventLoop,
+        sasl_plain_password: str,
+        sasl_plain_username: str,
+        sasl_mechanism: Literal["SCRAM-SHA-256", "SCRAM-SHA-512"],
+    ) -> None:
         self._loop = loop
         self._nonce = str(uuid.uuid4()).replace("-", "")
         self._auth_message = ""
-        self._salted_password = None
+        self._salted_password: Optional[bytes] = None
         self._sasl_plain_username = sasl_plain_username
         self._sasl_plain_password = sasl_plain_password.encode("utf-8")
         self._hashfunc = self.MECHANISMS[sasl_mechanism]
         self._hashname = "".join(sasl_mechanism.lower().split("-")[1:3])
-        self._stored_key = None
-        self._client_key = None
-        self._client_signature = None
-        self._client_proof = None
-        self._server_key = None
-        self._server_signature = None
+        self._stored_key: Optional[bytes] = None
+        self._client_key: Optional[bytes] = None
+        self._client_signature: Optional[bytes] = None
+        self._client_proof: Optional[bytes] = None
+        self._server_key: Optional[bytes] = None
+        self._server_signature: Optional[bytes] = None
         self._authenticator = self.authenticator_scram()
 
     def first_message(self):
@@ -723,7 +811,7 @@ class ScramAuthenticator(BaseSaslAuthenticator):
         self._auth_message += client_first_bare
         return "n,," + client_first_bare
 
-    def process_server_first_message(self, server_first):
+    def process_server_first_message(self, server_first: str):
         self._auth_message += "," + server_first
         params = dict(pair.split("=", 1) for pair in server_first.split(","))
         server_nonce = params["r"]
@@ -735,6 +823,7 @@ class ScramAuthenticator(BaseSaslAuthenticator):
         salt = base64.b64decode(params["s"].encode("utf-8"))
         iterations = int(params["i"])
         self.create_salted_password(salt, iterations)
+        assert self._salted_password is not None
 
         self._client_key = self.hmac(self._salted_password, b"Client Key")
         self._stored_key = self._hashfunc(self._client_key).digest()
@@ -749,11 +838,12 @@ class ScramAuthenticator(BaseSaslAuthenticator):
             self._server_key, self._auth_message.encode("utf-8")
         )
 
-    def final_message(self):
+    def final_message(self) -> str:
+        assert self._client_proof is not None
         client_proof = base64.b64encode(self._client_proof).decode("utf-8")
         return f"c=biws,r={self._nonce},p={client_proof}"
 
-    def process_server_final_message(self, server_final):
+    def process_server_final_message(self, server_final) -> None:
         params = dict(pair.split("=", 1) for pair in server_final.split(","))
         if self._server_signature != base64.b64decode(params["v"].encode("utf-8")):
             raise ValueError("Server sent wrong signature!")
@@ -766,25 +856,25 @@ class ScramAuthenticator(BaseSaslAuthenticator):
         server_final = yield client_final, True
         self.process_server_final_message(server_final.decode("utf-8"))
 
-    def hmac(self, key, msg):
+    def hmac(self, key: bytes, msg: Optional[Buffer]) -> bytes:
         return hmac.new(key, msg, digestmod=self._hashfunc).digest()
 
-    def create_salted_password(self, salt, iterations):
+    def create_salted_password(self, salt: Buffer, iterations: int) -> None:
         self._salted_password = hashlib.pbkdf2_hmac(
             self._hashname, self._sasl_plain_password, salt, iterations
         )
 
     @staticmethod
-    def _xor_bytes(left, right):
+    def _xor_bytes(left: bytes, right: bytes) -> bytes:
         return bytes(lb ^ rb for lb, rb in zip(left, right))
 
 
 class OAuthAuthenticator(BaseSaslAuthenticator):
-    def __init__(self, *, sasl_oauth_token_provider):
+    def __init__(self, *, sasl_oauth_token_provider) -> None:
         self._sasl_oauth_token_provider = sasl_oauth_token_provider
         self._token_sent = False
 
-    async def step(self, payload):
+    async def step(self, payload) -> Optional[Tuple[bytes, bool]]:
         if self._token_sent:
             return None
         token = await self._sasl_oauth_token_provider.token()
@@ -795,10 +885,10 @@ class OAuthAuthenticator(BaseSaslAuthenticator):
             True,
         )
 
-    def _build_oauth_client_request(self, token, token_extensions):
+    def _build_oauth_client_request(self, token: str, token_extensions: str) -> str:
         return f"n,,\x01auth=Bearer {token}{token_extensions}\x01\x01"
 
-    def _token_extensions(self):
+    def _token_extensions(self) -> str:
         """
         Return a string representation of the OPTIONAL key-value pairs
         that can be sent with an OAUTHBEARER initial request.
@@ -815,7 +905,13 @@ class OAuthAuthenticator(BaseSaslAuthenticator):
         return ""
 
 
-def _address_family(address):
+def _address_family(
+    address: str,
+) -> Literal[
+    socket.AddressFamily.AF_INET,
+    socket.AddressFamily.AF_INET6,
+    socket.AddressFamily.AF_UNSPEC,
+]:
     """
     Attempt to determine the family of an address (or hostname)
 
@@ -823,18 +919,28 @@ def _address_family(address):
     if the address family could not be determined
     """
     if address.startswith("[") and address.endswith("]"):
-        return socket.AF_INET6
-    for af in (socket.AF_INET, socket.AF_INET6):
+        return socket.AddressFamily.AF_INET6
+    for af in (socket.AddressFamily.AF_INET, socket.AddressFamily.AF_INET6):
         try:
             socket.inet_pton(af, address)
         except (OSError, ValueError, AttributeError):  # noqa: PERF203
             continue
         else:
             return af
-    return socket.AF_UNSPEC
+    return socket.AddressFamily.AF_UNSPEC
 
 
-def get_ip_port_afi(host_and_port_str):
+def get_ip_port_afi(
+    host_and_port_str: str,
+) -> Tuple[
+    str,
+    int,
+    Literal[
+        socket.AddressFamily.AF_INET,
+        socket.AddressFamily.AF_INET6,
+        socket.AddressFamily.AF_UNSPEC,
+    ],
+]:
     """
     Parse the IP and port from a string in the format of:
 
@@ -850,15 +956,16 @@ def get_ip_port_afi(host_and_port_str):
     :return: tuple (host, port, afi), afi will be socket.AF_INET or
     socket.AF_INET6 or socket.AF_UNSPEC
     """
+    port: Union[str, int]
+
     host_and_port_str = host_and_port_str.strip()
     if host_and_port_str.startswith("["):
-        af = socket.AF_INET6
         host, rest = host_and_port_str[1:].split("]")
         if rest:
             port = int(rest[1:])
         else:
             port = DEFAULT_KAFKA_PORT
-        return host, port, af
+        return host, port, socket.AddressFamily.AF_INET6
     elif ":" not in host_and_port_str:
         af = _address_family(host_and_port_str)
         return host_and_port_str, DEFAULT_KAFKA_PORT, af
@@ -868,7 +975,7 @@ def get_ip_port_afi(host_and_port_str):
         # host:port pair
         try:
             # if it decodes as an IPv6 address, use that
-            socket.inet_pton(socket.AF_INET6, host_and_port_str)
+            socket.inet_pton(socket.AddressFamily.AF_INET6, host_and_port_str)
         except AttributeError:
             log.warning(
                 "socket.inet_pton not available on this platform."
@@ -878,7 +985,7 @@ def get_ip_port_afi(host_and_port_str):
             # it's a host:port pair
             pass
         else:
-            return host_and_port_str, DEFAULT_KAFKA_PORT, socket.AF_INET6
+            return host_and_port_str, DEFAULT_KAFKA_PORT, socket.AddressFamily.AF_INET6
         host, port = host_and_port_str.rsplit(":", 1)
         port = int(port)
 
@@ -886,7 +993,9 @@ def get_ip_port_afi(host_and_port_str):
         return host, port, af
 
 
-def collect_hosts(hosts, randomize=True):
+def collect_hosts(
+    hosts: Union[str, Iterable[str]], randomize: bool = True
+) -> List[Tuple[str, int, int]]:
     """
     Collects a comma-separated set of hosts (host:port) and optionally
     randomize the returned list.
@@ -895,7 +1004,7 @@ def collect_hosts(hosts, randomize=True):
     if isinstance(hosts, str):
         hosts = hosts.strip().split(",")
 
-    result = []
+    result: List[Tuple[str, int, int]] = []
     afi = socket.AF_INET
     for host_port in hosts:
         host, port, afi = get_ip_port_afi(host_port)
